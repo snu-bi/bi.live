@@ -1,95 +1,99 @@
-const fs = require('mz/fs');
-const path = require('path');
 const http = require('http');
-const url = require('url');
 const { Readable } = require('stream');
 const colors = require('colors/safe');
 
-// Setup frames in memory
-// Load frames into memory once
-let original = [];
-let flipped = [];
+const TEXT = '장병탁 교수님 만세';
+const SCREEN_WIDTH = 80;
+const SCREEN_HEIGHT = 24;
 
-(async () => {
-  const framesPath = 'frames';
-  const files = await fs.readdir(framesPath);
+// Calculate display width (Korean chars = 2 columns, ASCII = 1)
+function displayWidth(str) {
+  let width = 0;
+  for (const ch of str) {
+    const code = ch.codePointAt(0);
+    if (
+      (code >= 0x1100 && code <= 0x115F) ||
+      (code >= 0x2E80 && code <= 0x303E) ||
+      (code >= 0x3040 && code <= 0x33BF) ||
+      (code >= 0x3400 && code <= 0x4DBF) ||
+      (code >= 0x4E00 && code <= 0x9FFF) ||
+      (code >= 0xAC00 && code <= 0xD7AF) ||
+      (code >= 0xF900 && code <= 0xFAFF) ||
+      (code >= 0xFF01 && code <= 0xFF60) ||
+      (code >= 0x20000 && code <= 0x2FA1F)
+    ) {
+      width += 2;
+    } else {
+      width += 1;
+    }
+  }
+  return width;
+}
 
-  original = await Promise.all(files.map(async (file) => {
-    const frame = await fs.readFile(path.join(framesPath, file));
-    return frame.toString();
-  }));
-  flipped = original.map(f => {
-    return f
-      .toString()
-      .split('')
-      .reverse()
-      .join('')
-  })
-})().catch((err) => {
-  console.log('Error loading frames');
-  console.log(err);
-});
+const textDisplayWidth = displayWidth(TEXT);
+const padding = 2;
+const innerWidth = padding + textDisplayWidth + padding;
+const boxDisplayWidth = 1 + innerWidth + 1;
 
-const colorsOptions = [
-  'red',
-  'yellow',
-  'green',
-  'blue',
-  'magenta',
-  'cyan',
-  'white'
+const boxLines = [
+  '\u2554' + '\u2550'.repeat(innerWidth) + '\u2557',
+  '\u2551' + ' '.repeat(padding) + TEXT + ' '.repeat(padding) + '\u2551',
+  '\u255A' + '\u2550'.repeat(innerWidth) + '\u255D',
 ];
+const boxHeight = boxLines.length;
+
+const colorsOptions = ['red', 'yellow', 'green', 'blue', 'magenta', 'cyan', 'white'];
 const numColors = colorsOptions.length;
-const selectColor = previousColor => {
-  let color;
 
-  do {
-    color = Math.floor(Math.random() * numColors);
-  } while (color === previousColor);
-
-  return color;
-};
-
-function streamer(stream, opts) {
-  const frames = opts.flip ? flipped : original;
-  let index = 0;
-  let lastColor;
+function streamer(stream) {
+  let x = Math.floor(Math.random() * (SCREEN_WIDTH - boxDisplayWidth));
+  let y = Math.floor(Math.random() * (SCREEN_HEIGHT - boxHeight));
+  let dx = Math.random() > 0.5 ? 1 : -1;
+  let dy = Math.random() > 0.5 ? 1 : -1;
+  let colorIdx = Math.floor(Math.random() * numColors);
   let timer;
 
   function tick() {
-    // clear screen
+    let frame = '';
+    for (let row = 0; row < SCREEN_HEIGHT; row++) {
+      if (row >= y && row < y + boxHeight) {
+        frame += ' '.repeat(x) + boxLines[row - y];
+      }
+      frame += '\n';
+    }
+
     stream.push('\u001b[2J\u001b[3J\u001b[H');
-
-    // color frame
-    const colorIdx = lastColor = selectColor(lastColor);
-    const coloredFrame = colors[colorsOptions[colorIdx]](frames[index]);
-
-    // try to push; respect backpressure
+    const coloredFrame = colors[colorsOptions[colorIdx]](frame);
     const ok = stream.push(coloredFrame);
-    index = (index + 1) % frames.length;
+
+    // Update position
+    x += dx;
+    y += dy;
+
+    // Bounce off walls and change color
+    if (x <= 0 || x >= SCREEN_WIDTH - boxDisplayWidth) {
+      dx = -dx;
+      colorIdx = (colorIdx + 1) % numColors;
+    }
+    if (y <= 0 || y >= SCREEN_HEIGHT - boxHeight) {
+      dy = -dy;
+      colorIdx = (colorIdx + 1) % numColors;
+    }
 
     if (ok) {
-      timer = setTimeout(tick, 70);
+      timer = setTimeout(tick, 100);
     } else {
       stream.once('drain', () => {
-        timer = setTimeout(tick, 70);
+        timer = setTimeout(tick, 100);
       });
     }
   }
 
-  // start
   tick();
-
-  // cleanup function
-  return () => {
-    clearTimeout(timer);
-  };
+  return () => clearTimeout(timer);
 }
 
-const validateQuery = ({ flip }) => ({ flip: String(flip).toLowerCase() === 'true' });
-
 const server = http.createServer((req, res) => {
-  // Healthcheck route
   if (req.url === '/healthcheck') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ status: 'ok' }));
@@ -108,11 +112,8 @@ const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
   stream.pipe(res);
 
-  // Start streaming with cleanup handler
-  const opts = validateQuery(url.parse(req.url, true).query);
-  const cleanupLoop = streamer(stream, opts);
+  const cleanupLoop = streamer(stream);
 
-  // Clean up when the client disconnects
   const onClose = () => {
     cleanupLoop();
     stream.destroy();
@@ -121,9 +122,8 @@ const server = http.createServer((req, res) => {
   res.on('error', onClose);
 });
 
-const port = process.env.PARROT_PORT || 3000;
+const port = process.env.PORT || 3000;
 server.listen(port, err => {
   if (err) throw err;
   console.log(`Listening on http://localhost:${port}`);
 });
-
